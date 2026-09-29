@@ -6,3 +6,4 @@ __pycache__/
 .DS_Store
 .env
 .git-backup/
+data/external/social_chemistry/social-chem-101.v1.0.tsv
