@@ -10,5 +10,4 @@ Initial implementation roadmap:
 6. Add natural-language response generation
 7. Evaluate sensitivity, ablation, and human ratings
 8. Build frontend and advanced counterfactual simulation
-
-The first milestone intentionally uses a simple, interpretable baseline. It is not the final intelligence layer.
+The first milestone intentionally uses a simple, interpretable baseline. It is not the final intelligence layer
