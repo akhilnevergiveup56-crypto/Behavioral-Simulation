@@ -5,3 +5,4 @@ scikit-learn
 numpy
 pandas
 joblib
+transformers==4.56.2

@@ -7,3 +7,10 @@ __pycache__/
 .env
 .git-backup/
 data/external/social_chemistry/social-chem-101.v1.0.tsv
+# Processed datasets
+data/processed/
+
+# Trained model checkpoints
+checkpoints/
+# External datasets
+data/external/
