@@ -1,5 +1,6 @@
 
 import argparse
+import random
 from pathlib import Path
 
 import torch
@@ -11,6 +12,19 @@ from src.models.emotion_encoder import (
     MultiTaskEmotionEncoder,
     compute_multitask_loss,
 )
+from src.training.class_weights import (
+    compute_goemotions_pos_weights,
+)
+
+
+def set_seed(seed=42):
+    """Set random seeds for reproducible experiments."""
+
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def get_device():
@@ -19,30 +33,48 @@ def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
 
-    if hasattr(torch.backends, "mps"):
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
+    if (
+        hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    ):
+        return torch.device("mps")
 
     return torch.device("cpu")
 
 
-def limit_dataloader(loader, max_samples=None, shuffle=False):
-    """Optionally limit dataset size for a small test run."""
+def limit_dataloader(
+    loader,
+    max_samples=None,
+    shuffle=False,
+    seed=42,
+):
+    """Select a reproducible random subset of the dataset."""
 
     if max_samples is None:
         return loader
 
-    sample_count = min(max_samples, len(loader.dataset))
+    sample_count = min(
+        max_samples,
+        len(loader.dataset),
+    )
+
+    generator = torch.Generator().manual_seed(seed)
+
+    indices = torch.randperm(
+        len(loader.dataset),
+        generator=generator,
+    )[:sample_count].tolist()
 
     subset = Subset(
         loader.dataset,
-        range(sample_count),
+        indices,
     )
 
     return DataLoader(
         subset,
         batch_size=loader.batch_size,
         shuffle=shuffle,
+        generator=generator,
     )
 
 
@@ -51,10 +83,9 @@ def run_epoch(
     dataloader,
     device,
     optimizer=None,
+    goemotions_pos_weight=None,
 ):
-    """
-    Run one training or validation epoch.
-    """
+    """Run one training or validation epoch."""
 
     training = optimizer is not None
     model.train(training)
@@ -62,12 +93,16 @@ def run_epoch(
     total_loss_sum = 0.0
     main_loss_sum = 0.0
     auxiliary_loss_sum = 0.0
+
     example_count = 0
 
     for batch in dataloader:
 
         input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+
+        attention_mask = batch[
+            "attention_mask"
+        ].to(device)
 
         goemotions_targets = batch[
             "goemotions_targets"
@@ -91,17 +126,27 @@ def run_epoch(
                 attention_mask=attention_mask,
             )
 
+            # Apply class weights during training only.
+            # Keep validation loss unweighted.
+            current_pos_weight = (
+                goemotions_pos_weight
+                if training
+                else None
+            )
+
             losses = compute_multitask_loss(
                 outputs=outputs,
                 goemotions_targets=goemotions_targets,
                 project_emotion_targets=project_targets,
                 project_emotion_mask=project_mask,
                 auxiliary_weight=0.3,
+                goemotions_pos_weight=current_pos_weight,
             )
 
             loss = losses["total_loss"]
 
             if training:
+
                 loss.backward()
 
                 torch.nn.utils.clip_grad_norm_(
@@ -113,7 +158,9 @@ def run_epoch(
 
         batch_size = input_ids.size(0)
 
-        total_loss_sum += loss.item() * batch_size
+        total_loss_sum += (
+            loss.item() * batch_size
+        )
 
         main_loss_sum += (
             losses["main_loss"].item() * batch_size
@@ -126,7 +173,9 @@ def run_epoch(
         example_count += batch_size
 
     if example_count == 0:
-        raise ValueError("DataLoader produced no examples.")
+        raise ValueError(
+            "DataLoader produced no examples."
+        )
 
     return {
         "total_loss": total_loss_sum / example_count,
@@ -177,6 +226,12 @@ def main():
         default=None,
     )
 
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+    )
+
     args = parser.parse_args()
 
     if args.epochs < 1 or args.batch_size < 1:
@@ -185,6 +240,21 @@ def main():
     if args.learning_rate <= 0 or args.max_length < 1:
         parser.error("Learning rate and max length must be positive.")
 
+    if (
+        args.max_train_samples is not None
+        and args.max_train_samples < 1
+    ):
+        parser.error("Maximum training samples must be positive.")
+
+    if (
+        args.max_val_samples is not None
+        and args.max_val_samples < 1
+    ):
+        parser.error("Maximum validation samples must be positive.")
+
+    set_seed(args.seed)
+
+    # Project directories
     project_root = Path(__file__).resolve().parents[2]
 
     train_path = (
@@ -203,10 +273,11 @@ def main():
         / "dev.jsonl"
     )
 
+    # Keep this experiment separate from the previous model.
     output_dir = (
         project_root
         / "checkpoints"
-        / "goemotions-distilbert"
+        / "goemotions-distilbert-weighted"
     )
 
     if not train_path.exists():
@@ -218,12 +289,39 @@ def main():
     device = get_device()
 
     print("Training device:", device)
-    print("Loading tokenizer...")
+    print("Random seed:", args.seed)
 
+    # Calculate class weights using training data only.
+    print("\nCalculating emotion class weights...")
+
+    goemotions_pos_weight = compute_goemotions_pos_weights(
+        train_path,
+        max_weight=10.0,
+    ).to(device)
+
+    print(
+        "Number of class weights:",
+        len(goemotions_pos_weight),
+    )
+
+    print(
+        "Minimum class weight:",
+        round(goemotions_pos_weight.min().item(), 4),
+    )
+
+    print(
+        "Maximum class weight:",
+        round(goemotions_pos_weight.max().item(), 4),
+    )
+
+    # Load tokenizer
     model_name = "distilbert-base-uncased"
+
+    print("\nLoading tokenizer...")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
+    # Create DataLoaders
     print("Creating DataLoaders...")
 
     train_loader = create_goemotions_dataloader(
@@ -242,22 +340,33 @@ def main():
         shuffle=False,
     )
 
+    # Optionally select reproducible random subsets.
     train_loader = limit_dataloader(
         train_loader,
-        args.max_train_samples,
+        max_samples=args.max_train_samples,
         shuffle=True,
+        seed=args.seed,
     )
 
     val_loader = limit_dataloader(
         val_loader,
-        args.max_val_samples,
+        max_samples=args.max_val_samples,
         shuffle=False,
+        seed=args.seed,
     )
 
-    print("Training examples:", len(train_loader.dataset))
-    print("Validation examples:", len(val_loader.dataset))
+    print(
+        "Training examples:",
+        len(train_loader.dataset),
+    )
 
-    print("Loading emotion model...")
+    print(
+        "Validation examples:",
+        len(val_loader.dataset),
+    )
+
+    # Load model
+    print("\nLoading emotion model...")
 
     model = MultiTaskEmotionEncoder(
         model_name=model_name,
@@ -265,6 +374,7 @@ def main():
         num_project_emotions=8,
     ).to(device)
 
+    # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -278,53 +388,86 @@ def main():
         exist_ok=True,
     )
 
+    # Training loop
     for epoch in range(args.epochs):
 
-        print(f"\nEpoch {epoch + 1}/{args.epochs}")
+        print(
+            f"\n========== EPOCH {epoch + 1}/{args.epochs} =========="
+        )
 
+        # Training uses weighted loss.
         train_metrics = run_epoch(
             model=model,
             dataloader=train_loader,
             device=device,
             optimizer=optimizer,
+            goemotions_pos_weight=goemotions_pos_weight,
         )
 
+        # Validation uses unweighted loss.
         val_metrics = run_epoch(
             model=model,
             dataloader=val_loader,
             device=device,
             optimizer=None,
+            goemotions_pos_weight=None,
         )
 
-        print("\nTraining:")
-        print(f"Total loss: {train_metrics['total_loss']:.4f}")
-        print(f"Main loss: {train_metrics['main_loss']:.4f}")
+        # Display training results.
+        print("\nTraining metrics (weighted):")
+
         print(
-            f"Auxiliary loss: "
-            f"{train_metrics['auxiliary_loss']:.4f}"
+            f"Total loss: {train_metrics['total_loss']:.4f}"
         )
 
-        print("\nValidation:")
-        print(f"Total loss: {val_metrics['total_loss']:.4f}")
-        print(f"Main loss: {val_metrics['main_loss']:.4f}")
         print(
-            f"Auxiliary loss: "
-            f"{val_metrics['auxiliary_loss']:.4f}"
+            f"Main loss: {train_metrics['main_loss']:.4f}"
         )
 
-        if val_metrics["total_loss"] < best_val_loss:
+        print(
+            f"Auxiliary loss: {train_metrics['auxiliary_loss']:.4f}"
+        )
 
-            best_val_loss = val_metrics["total_loss"]
+        # Display validation results.
+        print("\nValidation metrics (unweighted):")
 
-            checkpoint_path = output_dir / "best_model.pt"
+        print(
+            f"Total loss: {val_metrics['total_loss']:.4f}"
+        )
+
+        print(
+            f"Main loss: {val_metrics['main_loss']:.4f}"
+        )
+
+        print(
+            f"Auxiliary loss: {val_metrics['auxiliary_loss']:.4f}"
+        )
+
+        # Preserve the checkpoint with the best validation
+        # main loss.
+        if val_metrics["main_loss"] < best_val_loss:
+
+            best_val_loss = val_metrics["main_loss"]
+
+            checkpoint_path = (
+                output_dir / "best_model.pt"
+            )
+
+            cpu_state_dict = {
+                key: value.detach().cpu()
+                for key, value in model.state_dict().items()
+            }
 
             torch.save(
                 {
                     "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": cpu_state_dict,
                     "model_name": model_name,
                     "max_length": args.max_length,
-                    "validation_loss": best_val_loss,
+                    "validation_main_loss": best_val_loss,
+                    "validation_total_loss": val_metrics["total_loss"],
+                    "class_weights": goemotions_pos_weight.cpu(),
+                    "seed": args.seed,
                 },
                 checkpoint_path,
             )
@@ -333,10 +476,22 @@ def main():
                 output_dir / "tokenizer"
             )
 
-            print("\nBest model saved:", checkpoint_path)
+            print(
+                "\nBest model saved:",
+                checkpoint_path,
+            )
 
     print("\nTraining completed.")
-    print("Best validation loss:", best_val_loss)
+
+    print(
+        "Best validation main loss:",
+        best_val_loss,
+    )
+
+    print(
+        "Checkpoint directory:",
+        output_dir,
+    )
 
 
 if __name__ == "__main__":
